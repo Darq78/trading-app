@@ -137,6 +137,8 @@ def fetch_stock_data(ticker: str) -> dict | None:
             "ticker": ticker,
             "name": company_name,
             "current_price": float(current_price),
+            "op_cf": float(op_cf),
+            "avg_capex": avg_capex,
             "base_cf": base_cf,
             "net_income": net_income,
             "growing_cf": growing_cf,
@@ -144,6 +146,7 @@ def fetch_stock_data(ticker: str) -> dict | None:
             "total_debt": float(total_debt),
             "cash": float(cash),
             "beta": float(beta),
+            "raw_eps": float(raw_eps) if raw_eps is not None else None,
             "eps_5y": float(eps_5y) if eps_5y else DEFAULT_EPS_5Y,
         }
     except Exception:
@@ -258,11 +261,12 @@ def compute_all(
     eps_6_10y: float,
     eps_11_20y: float,
     progress_bar=None,
-) -> tuple[pd.DataFrame, list[str]]:
+) -> tuple[pd.DataFrame, list[str], list[dict]]:
     """Fetch data and calculate intrinsic value for all tickers.
-    Returns (results_df, list_of_skipped_tickers)."""
+    Returns (results_df, list_of_skipped_tickers, raw_data_for_all_fetched)."""
     results = []
     skipped = []
+    all_raw = []
     for i, ticker in enumerate(tickers):
         if progress_bar:
             progress_bar.progress((i + 1) / len(tickers), text=f"Pobieram: {ticker}...")
@@ -270,6 +274,7 @@ def compute_all(
         if data is None:
             skipped.append(ticker)
             continue
+        all_raw.append(data)
         result = calculate_intrinsic_value(data, None, eps_6_10y, eps_11_20y)
         if result is None:
             skipped.append(ticker)
@@ -277,11 +282,63 @@ def compute_all(
         results.append(result)
 
     if not results:
-        return pd.DataFrame(), skipped
+        return pd.DataFrame(), skipped, all_raw
 
     df = pd.DataFrame(results)
     df = df.sort_values("diff_pct", ascending=False).reset_index(drop=True)
-    return df, skipped
+    return df, skipped, all_raw
+
+
+# ---------------------------------------------------------------------------
+# Data quality checks for verification tab
+# ---------------------------------------------------------------------------
+
+def assess_quality(row: dict) -> tuple[str, list[str]]:
+    """Return (status_emoji, list_of_reasons) for a single stock's raw data.
+
+    Returns:
+        ("green" | "yellow" | "red",  [reason strings])
+    """
+    issues_yellow = []
+    issues_red = []
+
+    ocf_m = row["op_cf"] / 1e6
+    capex_m = row["avg_capex"] / 1e6
+    fcf_m = row["base_cf"] / 1e6
+    shares_m = row["shares_outstanding"] / 1e6
+    raw_eps = row["raw_eps"]
+
+    # RED checks — data is probably wrong
+    if shares_m < 1:
+        issues_red.append(f"Akcje < 1M ({shares_m:.2f}M)")
+    if ocf_m == 0:
+        issues_red.append("OCF = 0")
+    if ocf_m > 1_000_000:
+        issues_red.append(f"OCF > 1 000 000M ({ocf_m:,.0f}M) — prawdopodobnie bledne jednostki")
+    if row["total_debt"] / 1e6 > 1_000_000:
+        issues_red.append(f"Dlug > 1 000 000M — prawdopodobnie bledne jednostki")
+    if row["cash"] / 1e6 > 1_000_000:
+        issues_red.append(f"Cash > 1 000 000M — prawdopodobnie bledne jednostki")
+
+    # YELLOW checks — something is suspicious
+    if raw_eps is not None and raw_eps > 0.30:
+        issues_yellow.append(f"EPS growth Yahoo = {raw_eps:.0%} (> 30%, uzyto domyslne 12%)")
+    if raw_eps is not None and raw_eps <= 0:
+        issues_yellow.append(f"EPS growth Yahoo = {raw_eps:.1%} (ujemny, uzyto domyslne 12%)")
+    if raw_eps is None:
+        issues_yellow.append("Brak EPS growth z Yahoo (uzyto domyslne 12%)")
+    if fcf_m < 0:
+        issues_yellow.append(f"FCF ujemny ({fcf_m:,.0f}M)")
+    if not row["growing_cf"]:
+        issues_yellow.append("OCF nie rosnie — metoda DE zamiast DCF")
+    if row["beta"] > 2.0:
+        issues_yellow.append(f"Beta bardzo wysoka ({row['beta']:.2f})")
+
+    if issues_red:
+        return "red", issues_red + issues_yellow
+    if issues_yellow:
+        return "yellow", issues_yellow
+    return "green", []
 
 
 # ---------------------------------------------------------------------------
@@ -290,11 +347,171 @@ def compute_all(
 
 def color_row(row):
     """Green for undervalued (positive diff), red for overvalued (negative diff)."""
-    if row["Różnica %"] > 0:
+    if row["Roznica %"] > 0:
         return ["background-color: #d4edda; color: #155724"] * len(row)
-    elif row["Różnica %"] < 0:
+    elif row["Roznica %"] < 0:
         return ["background-color: #f8d7da; color: #721c24"] * len(row)
     return [""] * len(row)
+
+
+def render_valuation_tab(df, skipped):
+    """Render the main valuation results tab."""
+    # --- Summary metrics ---
+    undervalued = len(df[df["diff_pct"] > 0])
+    overvalued = len(df[df["diff_pct"] < 0])
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Przeanalizowane", len(df))
+    col2.metric("Niedowartosciowane", undervalued)
+    col3.metric("Przewartosciowane", overvalued)
+    col4.metric("DCF / DE", f'{len(df[df["method"]=="DCF"])} / {len(df[df["method"]=="DE"])}')
+
+    if skipped:
+        st.info(
+            f"Pominiete spolki (brak danych lub ujemny FCF/zysk netto): "
+            f"**{', '.join(skipped)}**"
+        )
+
+    # --- Main table ---
+    display_df = df[[
+        "ticker", "name", "method", "current_price",
+        "intrinsic_value", "diff_pct",
+    ]].copy()
+    display_df.columns = [
+        "Ticker", "Spolka", "Metoda", "Cena ($)",
+        "Wartosc wewnetrzna ($)", "Roznica %",
+    ]
+
+    styled = (
+        display_df.style
+        .apply(color_row, axis=1)
+        .format({
+            "Cena ($)": "${:,.2f}",
+            "Wartosc wewnetrzna ($)": "${:,.2f}",
+            "Roznica %": "{:+.1f}%",
+        })
+    )
+
+    st.dataframe(styled, use_container_width=True, hide_index=True, height=740)
+
+    # --- Expandable: DCF breakdown ---
+    with st.expander("Szczegoly kalkulacji"):
+        detail_df = df[[
+            "ticker", "method", "beta", "discount_rate", "eps_5y",
+            "base_cf", "total_dcf", "value_per_share",
+            "debt_per_share", "cash_per_share", "intrinsic_value",
+        ]].copy()
+        detail_df.columns = [
+            "Ticker", "Metoda", "Beta", "Stopa dysk.", "EPS 5Y",
+            "Baza CF ($)", "Suma DCF ($)", "Wartosc/akcje ($)",
+            "Dlug/akcje ($)", "Gotowka/akcje ($)", "Wart. wewn. ($)",
+        ]
+        st.dataframe(
+            detail_df.style.format({
+                "Beta": "{:.2f}",
+                "Stopa dysk.": "{:.1%}",
+                "EPS 5Y": "{:.1%}",
+                "Baza CF ($)": "${:,.0f}",
+                "Suma DCF ($)": "${:,.0f}",
+                "Wartosc/akcje ($)": "${:,.2f}",
+                "Dlug/akcje ($)": "${:,.2f}",
+                "Gotowka/akcje ($)": "${:,.2f}",
+                "Wart. wewn. ($)": "${:,.2f}",
+            }),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+
+def render_verification_tab(all_raw):
+    """Render the data verification / quality control tab."""
+    if not all_raw:
+        st.warning("Brak danych do weryfikacji. Odswierz dane na zakladce Wycena.")
+        return
+
+    # Build verification table and quality assessments
+    rows = []
+    for d in all_raw:
+        status, reasons = assess_quality(d)
+        method = "DCF" if d["growing_cf"] else "DE"
+        emoji = {"green": "🟢", "yellow": "🟡", "red": "🔴"}[status]
+        rows.append({
+            "Status": emoji,
+            "Ticker": d["ticker"],
+            "OCF TTM ($M)": round(d["op_cf"] / 1e6, 1),
+            "CapEx sr. 3 lata ($M)": round(d["avg_capex"] / 1e6, 1),
+            "FCF ($M)": round(d["base_cf"] / 1e6, 1),
+            "Total Debt ($M)": round(d["total_debt"] / 1e6, 1),
+            "Cash ($M)": round(d["cash"] / 1e6, 1),
+            "Akcje (M)": round(d["shares_outstanding"] / 1e6, 1),
+            "Beta": round(d["beta"], 2),
+            "Stopa dysk. (%)": round(beta_to_discount_rate(d["beta"]) * 100, 1),
+            "EPS Growth 5Y (%)": round(d["eps_5y"] * 100, 1),
+            "EPS Yahoo raw (%)": round(d["raw_eps"] * 100, 1) if d["raw_eps"] is not None else None,
+            "Metoda": method,
+            "_status": status,
+            "_reasons": reasons,
+        })
+
+    vdf = pd.DataFrame(rows)
+
+    # --- Summary counts ---
+    n_green = sum(1 for r in rows if r["_status"] == "green")
+    n_yellow = sum(1 for r in rows if r["_status"] == "yellow")
+    n_red = sum(1 for r in rows if r["_status"] == "red")
+
+    st.markdown(
+        f"**Kontrola jakosci danych:** "
+        f"🟢 {n_green} OK  &nbsp;&nbsp; "
+        f"🟡 {n_yellow} watpliwe  &nbsp;&nbsp; "
+        f"🔴 {n_red} prawdopodobnie bledne  &nbsp;&nbsp; "
+        f"(lacznie {len(rows)} spolek)"
+    )
+
+    # --- Main verification table ---
+    display_cols = [
+        "Status", "Ticker", "OCF TTM ($M)", "CapEx sr. 3 lata ($M)",
+        "FCF ($M)", "Total Debt ($M)", "Cash ($M)", "Akcje (M)",
+        "Beta", "Stopa dysk. (%)", "EPS Growth 5Y (%)", "EPS Yahoo raw (%)",
+        "Metoda",
+    ]
+
+    def color_status_row(row):
+        status_char = row["Status"]
+        if status_char == "🔴":
+            return ["background-color: #f8d7da; color: #721c24"] * len(row)
+        elif status_char == "🟡":
+            return ["background-color: #fff3cd; color: #856404"] * len(row)
+        elif status_char == "🟢":
+            return ["background-color: #d4edda; color: #155724"] * len(row)
+        return [""] * len(row)
+
+    styled_v = (
+        vdf[display_cols].style
+        .apply(color_status_row, axis=1)
+        .format({
+            "OCF TTM ($M)": "{:,.1f}",
+            "CapEx sr. 3 lata ($M)": "{:,.1f}",
+            "FCF ($M)": "{:,.1f}",
+            "Total Debt ($M)": "{:,.1f}",
+            "Cash ($M)": "{:,.1f}",
+            "Akcje (M)": "{:,.1f}",
+            "Beta": "{:.2f}",
+            "Stopa dysk. (%)": "{:.1f}%",
+            "EPS Growth 5Y (%)": "{:.1f}%",
+            "EPS Yahoo raw (%)": "{:.1f}%",
+        }, na_rep="brak")
+    )
+
+    st.dataframe(styled_v, use_container_width=True, hide_index=True, height=740)
+
+    # --- Detailed issues per stock ---
+    flagged = [r for r in rows if r["_reasons"]]
+    if flagged:
+        with st.expander(f"Szczegoly problemow ({len(flagged)} spolek)"):
+            for r in flagged:
+                emoji = r["Status"]
+                reasons_str = " | ".join(r["_reasons"])
+                st.markdown(f"{emoji} **{r['Ticker']}**: {reasons_str}")
 
 
 def main():
@@ -306,13 +523,13 @@ def main():
 
     st.title("DCF Intrinsic Value Calculator")
     st.caption(
-        "Wycena wartości wewnętrznej spółek metodą zdyskontowanych przepływów pieniężnych (DCF) / "
-        "zdyskontowanych zysków (DE) — logika z Calculator_Intrinsic_Value.xlsx"
+        "Wycena wartosci wewnetrznej spolek metoda zdyskontowanych przeplywow pienieznych (DCF) / "
+        "zdyskontowanych zyskow (DE) — logika z Calculator_Intrinsic_Value.xlsx"
     )
 
     # --- Sidebar: growth assumptions ---
     with st.sidebar:
-        st.header("Założenia wzrostu")
+        st.header("Zalozenia wzrostu")
         st.markdown(
             "Stopa dyskontowa jest wyznaczana automatycznie na podstawie **Beta** "
             "(tabela progowa z Excela)."
@@ -320,23 +537,23 @@ def main():
 
         st.subheader("Fazy wzrostu (20 lat)")
 
-        st.markdown("**Lata 1-5:** stopa EPS next 5Y pobierana z Yahoo Finance per spółka")
+        st.markdown("**Lata 1-5:** stopa EPS next 5Y pobierana z Yahoo Finance per spolka")
 
         eps_6_10y = st.slider(
             "Lata 6-10: EPS growth (%)", 1.0, 30.0, DEFAULT_EPS_6_10Y * 100, 0.5,
-            help="Domyślnie 15% — z Excela B30",
+            help="Domyslnie 15% — z Excela B30",
         ) / 100
 
         eps_11_20y = st.slider(
             "Lata 11-20: EPS growth (%)", 1.0, 15.0, DEFAULT_EPS_11_20Y * 100, 0.1,
-            help="Domyślnie 4.18% — z Excela B31 (zbliżona do długoterminowego wzrostu PKB)",
+            help="Domyslnie 4.18% — z Excela B31 (zblizona do dlugoterminowego wzrostu PKB)",
         ) / 100
 
         st.divider()
-        st.markdown("**Tabela stóp dyskontowych (Beta → r):**")
+        st.markdown("**Tabela stop dyskontowych (Beta -> r):**")
         beta_table = pd.DataFrame({
-            "Beta": ["≤ 0.80", "0.81–1.05", "1.06–1.15", "1.16–1.25",
-                      "1.26–1.35", "1.36–1.45", "1.46–1.55", "> 1.55"],
+            "Beta": ["<= 0.80", "0.81-1.05", "1.06-1.15", "1.16-1.25",
+                      "1.26-1.35", "1.36-1.45", "1.46-1.55", "> 1.55"],
             "r": ["5.0%", "6.0%", "6.5%", "7.0%", "7.5%", "7.7%", "8.0%", "8.2%"],
         })
         st.dataframe(beta_table, hide_index=True, use_container_width=True)
@@ -344,14 +561,16 @@ def main():
         st.divider()
         st.markdown("**Metoda wyceny:**")
         st.markdown(
-            "- **DCF** — gdy Operating Cash Flow rośnie (baza = FCF)\n"
-            "- **DE** — gdy nie rośnie (baza = Net Income)"
+            "- **DCF** — gdy Operating Cash Flow rosnie (baza = FCF)\n"
+            "- **DE** — gdy nie rosnie (baza = Net Income)"
         )
 
     # --- Main area ---
-    if st.button("Odśwież dane", type="primary", use_container_width=True):
+    if st.button("Odswiez dane", type="primary", use_container_width=True):
         st.session_state.pop("df_results", None)
         st.session_state.pop("params", None)
+        st.session_state.pop("all_raw", None)
+        st.session_state.pop("skipped", None)
 
     current_params = (eps_6_10y, eps_11_20y)
 
@@ -360,83 +579,28 @@ def main():
 
     if "df_results" not in st.session_state:
         progress = st.progress(0, text="Pobieram dane z Yahoo Finance...")
-        df, skipped = compute_all(TICKERS, eps_6_10y, eps_11_20y, progress_bar=progress)
+        df, skipped, all_raw = compute_all(TICKERS, eps_6_10y, eps_11_20y, progress_bar=progress)
         progress.empty()
         st.session_state["df_results"] = df
         st.session_state["skipped"] = skipped
+        st.session_state["all_raw"] = all_raw
         st.session_state["params"] = current_params
 
     df = st.session_state.get("df_results", pd.DataFrame())
     skipped = st.session_state.get("skipped", [])
+    all_raw = st.session_state.get("all_raw", [])
 
-    if df.empty:
-        st.warning("Brak danych do wyświetlenia. Spróbuj odświeżyć.")
-        return
+    # --- Tabs ---
+    tab_valuation, tab_verification = st.tabs(["Wycena DCF", "Weryfikacja danych"])
 
-    # --- Summary metrics ---
-    undervalued = len(df[df["diff_pct"] > 0])
-    overvalued = len(df[df["diff_pct"] < 0])
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Przeanalizowane", len(df))
-    col2.metric("Niedowartościowane", undervalued)
-    col3.metric("Przewartościowane", overvalued)
-    col4.metric("DCF / DE", f'{len(df[df["method"]=="DCF"])} / {len(df[df["method"]=="DE"])}')
+    with tab_valuation:
+        if df.empty:
+            st.warning("Brak danych do wyswietlenia. Sprobuj odswiez.")
+        else:
+            render_valuation_tab(df, skipped)
 
-    if skipped:
-        st.info(
-            f"Pominięte spółki (brak danych lub ujemny FCF/zysk netto): "
-            f"**{', '.join(skipped)}**"
-        )
-
-    # --- Main table ---
-    display_df = df[[
-        "ticker", "name", "method", "current_price",
-        "intrinsic_value", "diff_pct",
-    ]].copy()
-    display_df.columns = [
-        "Ticker", "Spółka", "Metoda", "Cena ($)",
-        "Wartość wewnętrzna ($)", "Różnica %",
-    ]
-
-    styled = (
-        display_df.style
-        .apply(color_row, axis=1)
-        .format({
-            "Cena ($)": "${:,.2f}",
-            "Wartość wewnętrzna ($)": "${:,.2f}",
-            "Różnica %": "{:+.1f}%",
-        })
-    )
-
-    st.dataframe(styled, use_container_width=True, hide_index=True, height=740)
-
-    # --- Expandable: DCF breakdown ---
-    with st.expander("Szczegóły kalkulacji"):
-        detail_df = df[[
-            "ticker", "method", "beta", "discount_rate", "eps_5y",
-            "base_cf", "total_dcf", "value_per_share",
-            "debt_per_share", "cash_per_share", "intrinsic_value",
-        ]].copy()
-        detail_df.columns = [
-            "Ticker", "Metoda", "Beta", "Stopa dysk.", "EPS 5Y",
-            "Baza CF ($)", "Suma DCF ($)", "Wartość/akcję ($)",
-            "Dług/akcję ($)", "Gotówka/akcję ($)", "Wart. wewn. ($)",
-        ]
-        st.dataframe(
-            detail_df.style.format({
-                "Beta": "{:.2f}",
-                "Stopa dysk.": "{:.1%}",
-                "EPS 5Y": "{:.1%}",
-                "Baza CF ($)": "${:,.0f}",
-                "Suma DCF ($)": "${:,.0f}",
-                "Wartość/akcję ($)": "${:,.2f}",
-                "Dług/akcję ($)": "${:,.2f}",
-                "Gotówka/akcję ($)": "${:,.2f}",
-                "Wart. wewn. ($)": "${:,.2f}",
-            }),
-            use_container_width=True,
-            hide_index=True,
-        )
+    with tab_verification:
+        render_verification_tab(all_raw)
 
     st.divider()
     st.caption(
