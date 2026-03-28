@@ -100,9 +100,14 @@ def fetch_stock_data(ticker: str) -> dict | None:
         cash = info.get("totalCash", 0) or 0
         company_name = info.get("shortName", ticker)
 
-        # EPS growth next 5Y from Yahoo (earningsGrowth or earningsQuarterlyGrowth as proxy)
-        # Yahoo provides "earningsGrowth" as a decimal
-        eps_5y = info.get("earningsGrowth") or info.get("revenueGrowth") or DEFAULT_EPS_5Y
+        # EPS growth next 5Y from Yahoo Finance.
+        # earningsGrowth is YoY historical growth which can be extreme (e.g. 756% for MU).
+        # We cap it to a reasonable range for a 5-year forward projection.
+        raw_eps = info.get("earningsGrowth") or info.get("revenueGrowth")
+        if raw_eps is not None and 0 < raw_eps <= 0.30:
+            eps_5y = raw_eps
+        else:
+            eps_5y = DEFAULT_EPS_5Y
 
         # Check if operating cash flow is growing (compare last 2 years)
         growing_cf = True
@@ -216,7 +221,11 @@ def calculate_intrinsic_value(
         intrinsic_value = value_per_share - debt_per_share + cash_per_share
 
         # --- Step 9: Under/Overpriced ---
-        if intrinsic_value == 0:
+        # Skip if intrinsic value is non-positive or absurdly low vs market price
+        # (e.g. price > 3x IV means model inputs are unreliable for this stock)
+        if intrinsic_value <= 0:
+            return None
+        if data["current_price"] > intrinsic_value * 3:
             return None
         under_over = (data["current_price"] - intrinsic_value) / intrinsic_value
         diff_pct = -under_over * 100  # positive = undervalued
@@ -249,25 +258,30 @@ def compute_all(
     eps_6_10y: float,
     eps_11_20y: float,
     progress_bar=None,
-) -> pd.DataFrame:
-    """Fetch data and calculate intrinsic value for all tickers."""
+) -> tuple[pd.DataFrame, list[str]]:
+    """Fetch data and calculate intrinsic value for all tickers.
+    Returns (results_df, list_of_skipped_tickers)."""
     results = []
+    skipped = []
     for i, ticker in enumerate(tickers):
         if progress_bar:
             progress_bar.progress((i + 1) / len(tickers), text=f"Pobieram: {ticker}...")
         data = fetch_stock_data(ticker)
         if data is None:
+            skipped.append(ticker)
             continue
         result = calculate_intrinsic_value(data, None, eps_6_10y, eps_11_20y)
-        if result is not None:
-            results.append(result)
+        if result is None:
+            skipped.append(ticker)
+            continue
+        results.append(result)
 
     if not results:
-        return pd.DataFrame()
+        return pd.DataFrame(), skipped
 
     df = pd.DataFrame(results)
     df = df.sort_values("diff_pct", ascending=False).reset_index(drop=True)
-    return df
+    return df, skipped
 
 
 # ---------------------------------------------------------------------------
@@ -346,12 +360,14 @@ def main():
 
     if "df_results" not in st.session_state:
         progress = st.progress(0, text="Pobieram dane z Yahoo Finance...")
-        df = compute_all(TICKERS, eps_6_10y, eps_11_20y, progress_bar=progress)
+        df, skipped = compute_all(TICKERS, eps_6_10y, eps_11_20y, progress_bar=progress)
         progress.empty()
         st.session_state["df_results"] = df
+        st.session_state["skipped"] = skipped
         st.session_state["params"] = current_params
 
     df = st.session_state.get("df_results", pd.DataFrame())
+    skipped = st.session_state.get("skipped", [])
 
     if df.empty:
         st.warning("Brak danych do wyświetlenia. Spróbuj odświeżyć.")
@@ -365,6 +381,12 @@ def main():
     col2.metric("Niedowartościowane", undervalued)
     col3.metric("Przewartościowane", overvalued)
     col4.metric("DCF / DE", f'{len(df[df["method"]=="DCF"])} / {len(df[df["method"]=="DE"])}')
+
+    if skipped:
+        st.info(
+            f"Pominięte spółki (brak danych lub ujemny FCF/zysk netto): "
+            f"**{', '.join(skipped)}**"
+        )
 
     # --- Main table ---
     display_df = df[[
