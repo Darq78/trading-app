@@ -100,14 +100,50 @@ def fetch_stock_data(ticker: str) -> dict | None:
         cash = info.get("totalCash", 0) or 0
         company_name = info.get("shortName", ticker)
 
-        # EPS growth next 5Y from Yahoo Finance.
-        # earningsGrowth is YoY historical growth which can be extreme (e.g. 756% for MU).
-        # We cap it to a reasonable range for a 5-year forward projection.
-        raw_eps = info.get("earningsGrowth") or info.get("revenueGrowth")
-        if raw_eps is not None and 0 < raw_eps <= 0.30:
-            eps_5y = raw_eps
+        # EPS growth next 5Y — use analyst consensus from growth_estimates.
+        # Priority: growth_estimates['+1y'] > earnings_estimate['+1y'] > info > default
+        # Cap to 3-25% range for a realistic 5-year forward projection.
+        EPS_MIN, EPS_MAX = 0.03, 0.25
+        raw_eps = None
+        eps_source = "default"
+
+        # 1) Analyst consensus: growth_estimates '+1y' stockTrend
+        try:
+            ge = stock.growth_estimates
+            if ge is not None and not ge.empty and "+1y" in ge.index:
+                val = ge.loc["+1y", "stockTrend"]
+                if pd.notna(val):
+                    raw_eps = float(val)
+                    eps_source = "growth_estimates +1y"
+        except Exception:
+            pass
+
+        # 2) Fallback: earnings_estimate '+1y' growth
+        if raw_eps is None:
+            try:
+                ee = stock.earnings_estimate
+                if ee is not None and not ee.empty and "+1y" in ee.index:
+                    val = ee.loc["+1y", "growth"]
+                    if pd.notna(val):
+                        raw_eps = float(val)
+                        eps_source = "earnings_estimate +1y"
+            except Exception:
+                pass
+
+        # 3) Fallback: info earningsGrowth / revenueGrowth
+        if raw_eps is None:
+            raw_eps = info.get("earningsGrowth") or info.get("revenueGrowth")
+            if raw_eps is not None:
+                raw_eps = float(raw_eps)
+                eps_source = "info earningsGrowth"
+
+        # Clamp to reasonable range or use default
+        if raw_eps is not None and raw_eps > 0:
+            eps_5y = max(EPS_MIN, min(raw_eps, EPS_MAX))
+            eps_capped = raw_eps > EPS_MAX or raw_eps < EPS_MIN
         else:
             eps_5y = DEFAULT_EPS_5Y
+            eps_capped = False
 
         # Check if operating cash flow is growing (compare last 2 years)
         growing_cf = True
@@ -147,6 +183,8 @@ def fetch_stock_data(ticker: str) -> dict | None:
             "cash": float(cash),
             "beta": float(beta),
             "raw_eps": float(raw_eps) if raw_eps is not None else None,
+            "eps_source": eps_source,
+            "eps_capped": eps_capped,
             "eps_5y": float(eps_5y) if eps_5y else DEFAULT_EPS_5Y,
         }
     except Exception:
@@ -321,12 +359,18 @@ def assess_quality(row: dict) -> tuple[str, list[str]]:
         issues_red.append(f"Cash > 1 000 000M — prawdopodobnie bledne jednostki")
 
     # YELLOW checks — something is suspicious
-    if raw_eps is not None and raw_eps > 0.30:
-        issues_yellow.append(f"EPS growth Yahoo = {raw_eps:.0%} (> 30%, uzyto domyslne 12%)")
+    eps_capped = row.get("eps_capped", False)
+    eps_source = row.get("eps_source", "default")
+    if raw_eps is not None and raw_eps > 0.25:
+        issues_yellow.append(f"EPS raw = {raw_eps:.0%} → ograniczono do 25% ({eps_source})")
+    elif raw_eps is not None and 0 < raw_eps < 0.03:
+        issues_yellow.append(f"EPS raw = {raw_eps:.1%} → podniesiono do 3% ({eps_source})")
     if raw_eps is not None and raw_eps <= 0:
-        issues_yellow.append(f"EPS growth Yahoo = {raw_eps:.1%} (ujemny, uzyto domyslne 12%)")
+        issues_yellow.append(f"EPS raw = {raw_eps:.1%} (ujemny) → domyslne 12% ({eps_source})")
     if raw_eps is None:
-        issues_yellow.append("Brak EPS growth z Yahoo (uzyto domyslne 12%)")
+        issues_yellow.append("Brak EPS growth z Yahoo → domyslne 12%")
+    if eps_source == "default":
+        issues_yellow.append("Uzyto domyslny EPS 12% (brak danych analitycznych)")
     if fcf_m < 0:
         issues_yellow.append(f"FCF ujemny ({fcf_m:,.0f}M)")
     if not row["growing_cf"]:
@@ -447,6 +491,7 @@ def render_verification_tab(all_raw):
             "Stopa dysk. (%)": round(beta_to_discount_rate(d["beta"]) * 100, 1),
             "EPS Growth 5Y (%)": round(d["eps_5y"] * 100, 1),
             "EPS Yahoo raw (%)": round(d["raw_eps"] * 100, 1) if d["raw_eps"] is not None else None,
+            "Zrodlo EPS": d.get("eps_source", "default"),
             "Metoda": method,
             "_status": status,
             "_reasons": reasons,
@@ -472,7 +517,7 @@ def render_verification_tab(all_raw):
         "Status", "Ticker", "OCF TTM ($M)", "CapEx sr. 3 lata ($M)",
         "FCF ($M)", "Total Debt ($M)", "Cash ($M)", "Akcje (M)",
         "Beta", "Stopa dysk. (%)", "EPS Growth 5Y (%)", "EPS Yahoo raw (%)",
-        "Metoda",
+        "Zrodlo EPS", "Metoda",
     ]
 
     def color_status_row(row):
