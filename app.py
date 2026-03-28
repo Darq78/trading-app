@@ -16,9 +16,20 @@ import yfinance as yf
 # ---------------------------------------------------------------------------
 
 TICKERS = [
-    "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "AVGO",
-    "COST", "NFLX", "AMD", "ADBE", "INTC", "QCOM", "TXN", "ASML",
-    "AMAT", "MU", "LRCX", "KLAC",
+    # NASDAQ-100 components (101 tickers — Alphabet has 2 share classes)
+    "ADBE", "AMD", "ABNB", "ALNY", "GOOGL", "GOOG", "AMZN", "AEP",
+    "AMGN", "ADI", "AAPL", "AMAT", "APP", "ARM", "ASML", "TEAM",
+    "ADSK", "ADP", "AXON", "BKR", "BKNG", "AVGO", "CDNS", "CHTR",
+    "CTAS", "CSCO", "CCEP", "CTSH", "CMCSA", "CEG", "CPRT", "CSGP",
+    "COST", "CRWD", "CSX", "DDOG", "DXCM", "FANG", "DASH", "EA",
+    "EXC", "FAST", "FER", "FTNT", "GEHC", "GILD", "HON", "IDXX",
+    "INSM", "INTC", "INTU", "ISRG", "KDP", "KLAC", "KHC", "LRCX",
+    "LIN", "MAR", "MRVL", "MELI", "META", "MCHP", "MU", "MSFT",
+    "MSTR", "MDLZ", "MPWR", "MNST", "NFLX", "NVDA", "NXPI", "ORLY",
+    "ODFL", "PCAR", "PLTR", "PANW", "PAYX", "PYPL", "PDD", "PEP",
+    "QCOM", "REGN", "ROP", "ROST", "STX", "SHOP", "SBUX", "SNPS",
+    "TMUS", "TTWO", "TSLA", "TXN", "TRI", "VRSK", "VRTX", "WMT",
+    "WBD", "WDC", "WDAY", "XEL", "ZS",
 ]
 
 # Default growth rates (from Excel: B24, B30, B31)
@@ -294,37 +305,46 @@ def calculate_intrinsic_value(
         return None
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_all_raw(tickers: tuple[str, ...]) -> list[dict]:
+    """Fetch raw data for all tickers. Cached for 1 hour."""
+    all_raw = []
+    for ticker in tickers:
+        data = fetch_stock_data(ticker)
+        if data is not None:
+            all_raw.append(data)
+    return all_raw
+
+
 def compute_all(
-    tickers: list[str],
+    all_raw: list[dict],
     eps_6_10y: float,
     eps_11_20y: float,
-    progress_bar=None,
-) -> tuple[pd.DataFrame, list[str], list[dict]]:
-    """Fetch data and calculate intrinsic value for all tickers.
-    Returns (results_df, list_of_skipped_tickers, raw_data_for_all_fetched)."""
+) -> tuple[pd.DataFrame, list[str]]:
+    """Calculate intrinsic value for all fetched tickers.
+    Returns (results_df, list_of_skipped_tickers)."""
     results = []
     skipped = []
-    all_raw = []
-    for i, ticker in enumerate(tickers):
-        if progress_bar:
-            progress_bar.progress((i + 1) / len(tickers), text=f"Pobieram: {ticker}...")
-        data = fetch_stock_data(ticker)
-        if data is None:
-            skipped.append(ticker)
-            continue
-        all_raw.append(data)
+    all_tickers_fetched = {d["ticker"] for d in all_raw}
+
+    # Mark tickers that failed to fetch
+    for t in TICKERS:
+        if t not in all_tickers_fetched:
+            skipped.append(t)
+
+    for data in all_raw:
         result = calculate_intrinsic_value(data, None, eps_6_10y, eps_11_20y)
         if result is None:
-            skipped.append(ticker)
+            skipped.append(data["ticker"])
             continue
         results.append(result)
 
     if not results:
-        return pd.DataFrame(), skipped, all_raw
+        return pd.DataFrame(), skipped
 
     df = pd.DataFrame(results)
     df = df.sort_values("diff_pct", ascending=False).reset_index(drop=True)
-    return df, skipped, all_raw
+    return df, skipped
 
 
 # ---------------------------------------------------------------------------
@@ -612,28 +632,28 @@ def main():
 
     # --- Main area ---
     if st.button("Odswiez dane", type="primary", use_container_width=True):
+        fetch_all_raw.clear()
         st.session_state.pop("df_results", None)
         st.session_state.pop("params", None)
-        st.session_state.pop("all_raw", None)
-        st.session_state.pop("skipped", None)
 
     current_params = (eps_6_10y, eps_11_20y)
 
+    # Fetch raw data (cached for 1 hour, re-fetched only on "Odswiez dane")
+    with st.spinner(f"Pobieram dane z Yahoo Finance dla {len(TICKERS)} spolek..."):
+        all_raw = fetch_all_raw(tuple(TICKERS))
+
+    # Recalculate when params change (instant, no re-fetch)
     if st.session_state.get("params") != current_params:
         st.session_state.pop("df_results", None)
 
     if "df_results" not in st.session_state:
-        progress = st.progress(0, text="Pobieram dane z Yahoo Finance...")
-        df, skipped, all_raw = compute_all(TICKERS, eps_6_10y, eps_11_20y, progress_bar=progress)
-        progress.empty()
+        df, skipped = compute_all(all_raw, eps_6_10y, eps_11_20y)
         st.session_state["df_results"] = df
         st.session_state["skipped"] = skipped
-        st.session_state["all_raw"] = all_raw
         st.session_state["params"] = current_params
 
     df = st.session_state.get("df_results", pd.DataFrame())
     skipped = st.session_state.get("skipped", [])
-    all_raw = st.session_state.get("all_raw", [])
 
     # --- Tabs ---
     tab_valuation, tab_verification = st.tabs(["Wycena DCF", "Weryfikacja danych"])
