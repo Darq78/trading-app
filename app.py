@@ -1,8 +1,9 @@
 """
-Trading App Scoring — DCF / DE Intrinsic Value Calculator
-Streamlit app calculating intrinsic value using the exact logic from Calculator_Intrinsic_Value.xlsx.
+Trading App Scoring — DCF Intrinsic Value Calculator
+Streamlit app calculating intrinsic value using the exact logic from IV calc.xlsx Sheet4.
 
-DCF model (20-year projection, 3 growth phases, Beta-based discount rate).
+DCF model: 10-year projection, revenue-based growth Y1-5, 4% Y6-10,
+3% terminal growth, Beta-based discount rate, FX conversion for foreign stocks.
 """
 
 from __future__ import annotations
@@ -16,62 +17,58 @@ import yfinance as yf
 # ---------------------------------------------------------------------------
 
 TICKERS = [
-    # NASDAQ-100 components (101 tickers — Alphabet has 2 share classes)
-    "ADBE", "AMD", "ABNB", "ALNY", "GOOGL", "GOOG", "AMZN", "AEP",
-    "AMGN", "ADI", "AAPL", "AMAT", "APP", "ARM", "ASML", "TEAM",
-    "ADSK", "ADP", "AXON", "BKR", "BKNG", "AVGO", "CDNS", "CHTR",
-    "CTAS", "CSCO", "CCEP", "CTSH", "CMCSA", "CEG", "CPRT", "CSGP",
-    "COST", "CRWD", "CSX", "DDOG", "DXCM", "FANG", "DASH", "EA",
-    "EXC", "FAST", "FER", "FTNT", "GEHC", "GILD", "HON", "IDXX",
-    "INSM", "INTC", "INTU", "ISRG", "KDP", "KLAC", "KHC", "LRCX",
-    "LIN", "MAR", "MRVL", "MELI", "META", "MCHP", "MU", "MSFT",
-    "MSTR", "MDLZ", "MPWR", "MNST", "NFLX", "NVDA", "NXPI", "ORLY",
-    "ODFL", "PCAR", "PLTR", "PANW", "PAYX", "PYPL", "PDD", "PEP",
-    "QCOM", "REGN", "ROP", "ROST", "STX", "SHOP", "SBUX", "SNPS",
-    "TMUS", "TTWO", "TSLA", "TXN", "TRI", "VRSK", "VRTX", "WMT",
-    "WBD", "WDC", "WDAY", "XEL", "ZS",
+    "AAPL", "ACN", "ADBE", "AMZN", "ASML", "AVGO", "AZO", "BABA",
+    "BKNG", "CELH", "CNSWF", "CPRT", "CRM", "CRWD", "DPZ", "ELV",
+    "FTNT", "GOOG", "GOOGL", "HCA", "HSY", "ICE", "LMT", "LOW",
+    "LVMUY", "MA", "MEDP", "MELI", "META", "MSCI", "MSFT", "MSI",
+    "NKE", "NOW", "NVDA", "PANW", "PEP", "PLTR", "SPGI", "TMO",
+    "UNH", "V", "VEEV", "WM",
 ]
 
-# Default growth rates (from Excel: B24, B30, B31)
-DEFAULT_EPS_5Y = 0.12       # EPS next 5Y — overridden per-stock when available
-DEFAULT_EPS_6_10Y = 0.15    # EPS next 6-10Y
-DEFAULT_EPS_11_20Y = 0.0418 # EPS next 11-20Y (long-term GDP-like)
+# DCF assumptions (from Sheet4)
+GROWTH_6_10 = 0.04          # 4% FCF growth years 6-10
+TERMINAL_GROWTH = 0.03      # 3% terminal growth rate
+DEFAULT_GROWTH_5Y = 0.08    # 8% fallback when no analyst estimates
 
 # ---------------------------------------------------------------------------
-# DCF Engine — exact replica of Excel logic
+# DCF Engine — exact replica of IV calc.xlsx Sheet4
 # ---------------------------------------------------------------------------
 
 def beta_to_discount_rate(beta: float) -> float:
-    """
-    Excel formula from B34:
-    Beta ≤ 0.8  → 5%
-    0.8 < β ≤ 1.05  → 6%
-    1.05 < β ≤ 1.15 → 6.5%
-    1.15 < β ≤ 1.25 → 7%
-    1.25 < β ≤ 1.35 → 7.5%
-    1.35 < β ≤ 1.45 → 7.7%
-    1.45 < β ≤ 1.55 → 8%
-    β > 1.55         → 8.2%
-    """
-    if beta <= 0.80:
-        return 0.050
-    if beta <= 1.05:
-        return 0.060
-    if beta <= 1.15:
-        return 0.065
-    if beta <= 1.25:
-        return 0.070
-    if beta <= 1.35:
-        return 0.075
-    if beta <= 1.45:
-        return 0.077
-    if beta <= 1.55:
-        return 0.080
+    """Discount rate from Beta (Sheet4 B22 formula)."""
+    if beta <= 0.80: return 0.050
+    if beta <= 1.05: return 0.060
+    if beta <= 1.15: return 0.065
+    if beta <= 1.25: return 0.070
+    if beta <= 1.35: return 0.075
+    if beta <= 1.45: return 0.077
+    if beta <= 1.55: return 0.080
     return 0.082
 
 
-def fetch_stock_data(ticker: str) -> dict | None:
-    """Fetch all financial inputs from Yahoo Finance for a single ticker."""
+@st.cache_data(ttl=7200, show_spinner=False)
+def get_fx_rates() -> dict[str, float]:
+    """Fetch FX rates for foreign currency conversion. Cached 2 hours."""
+    rates = {"USD": 1.0}
+    for pair, curr in [("EURUSD=X", "EUR"), ("CNYUSD=X", "CNY")]:
+        try:
+            t = yf.Ticker(pair)
+            rate = t.info.get("regularMarketPrice") or t.info.get("previousClose")
+            if rate:
+                rates[curr] = float(rate)
+        except Exception:
+            pass
+    if "EUR" not in rates: rates["EUR"] = 1.08
+    if "CNY" not in rates: rates["CNY"] = 0.137
+    return rates
+
+
+def fetch_stock_data(ticker: str, fx_rates: dict[str, float]) -> dict | None:
+    """Fetch all financial inputs from Yahoo Finance for a single ticker.
+
+    Returns all raw data needed for DCF calculation, with FX conversion
+    applied for stocks reporting in non-USD currencies.
+    """
     try:
         stock = yf.Ticker(ticker)
         info = stock.info
@@ -80,226 +77,179 @@ def fetch_stock_data(ticker: str) -> dict | None:
         if cashflow is None or cashflow.empty:
             return None
 
-        # --- Operating Cash Flow (TTM) ---
-        op_cf = None
+        # Currency conversion factor
+        fin_curr = info.get("financialCurrency", "USD")
+        fx = fx_rates.get(fin_curr, 1.0)
+
+        # --- Operating Cash Flow TTM ---
+        ocf = None
         for label in ["Operating Cash Flow", "Total Cash From Operating Activities"]:
             if label in cashflow.index:
-                op_cf = cashflow.loc[label].dropna().iloc[0]
+                ocf = float(cashflow.loc[label].dropna().iloc[0]) * fx
                 break
-        if op_cf is None:
+        if ocf is None:
             return None
 
-        # --- Capital Expenditures (average of up to 3 most recent years) ---
-        capex_values = []
+        # --- CapEx TTM (single most recent year, NOT averaged) ---
+        capex = 0
         for label in ["Capital Expenditure", "Capital Expenditures"]:
             if label in cashflow.index:
-                capex_values = cashflow.loc[label].dropna().tolist()[:3]
+                capex = abs(float(cashflow.loc[label].dropna().iloc[0])) * fx
                 break
-        avg_capex = sum(capex_values) / len(capex_values) if capex_values else 0
-        # CapEx is typically negative in Yahoo Finance; we need its absolute value
-        avg_capex = abs(avg_capex)
 
-        # --- Free Cash Flow base = Operating CF - avg(CapEx) ---
-        # This matches Excel B16: =B15-B11 where B11=AVERAGE(B12:B14)
-        base_cf = float(op_cf) - avg_capex
+        # --- FCF = OCF - CapEx (Sheet4 B2: =B3-B4) ---
+        fcf = ocf - capex
 
-        # --- Other inputs ---
-        current_price = info.get("currentPrice") or info.get("regularMarketPrice")
-        shares_outstanding = info.get("sharesOutstanding")
-        beta = info.get("beta")
-        total_debt = info.get("totalDebt", 0) or 0
-        cash = info.get("totalCash", 0) or 0
-        company_name = info.get("shortName", ticker)
-
-        # EPS growth next 5Y — use analyst consensus from growth_estimates.
-        # Priority: growth_estimates['+1y'] > earnings_estimate['+1y'] > info > default
-        # Cap to 3-25% range for a realistic 5-year forward projection.
-        EPS_MIN, EPS_MAX = 0.03, 0.25
-        raw_eps = None
-        eps_source = "default"
-
-        # 1) Analyst consensus: growth_estimates '+1y' stockTrend
+        # --- Revenue growth Y1-5 from analyst estimates ---
+        # Sheet4: B5 = B7/B6 - 1 (Revenue estimate next yr / Revenue current yr - 1)
+        growth_flag = "ok"
+        rev_curr = rev_next = None
+        growth_5y = None
         try:
-            ge = stock.growth_estimates
-            if ge is not None and not ge.empty and "+1y" in ge.index:
-                val = ge.loc["+1y", "stockTrend"]
-                if pd.notna(val):
-                    raw_eps = float(val)
-                    eps_source = "growth_estimates +1y"
+            re = stock.revenue_estimate
+            if re is not None and not re.empty:
+                if "0y" in re.index and "+1y" in re.index:
+                    rc = re.loc["0y", "avg"]
+                    rn = re.loc["+1y", "avg"]
+                    if pd.notna(rc) and pd.notna(rn) and rc > 0:
+                        rev_curr = float(rc)
+                        rev_next = float(rn)
+                        growth_5y = float(rn / rc - 1)
         except Exception:
             pass
 
-        # 2) Fallback: earnings_estimate '+1y' growth
-        if raw_eps is None:
-            try:
-                ee = stock.earnings_estimate
-                if ee is not None and not ee.empty and "+1y" in ee.index:
-                    val = ee.loc["+1y", "growth"]
-                    if pd.notna(val):
-                        raw_eps = float(val)
-                        eps_source = "earnings_estimate +1y"
-            except Exception:
-                pass
+        if growth_5y is None or growth_5y <= -0.5 or growth_5y > 1.0:
+            growth_5y = DEFAULT_GROWTH_5Y
+            growth_flag = "default"
 
-        # 3) Fallback: info earningsGrowth / revenueGrowth
-        if raw_eps is None:
-            raw_eps = info.get("earningsGrowth") or info.get("revenueGrowth")
-            if raw_eps is not None:
-                raw_eps = float(raw_eps)
-                eps_source = "info earningsGrowth"
+        # --- Other inputs ---
+        current_price = info.get("currentPrice") or info.get("regularMarketPrice")
+        shares = info.get("sharesOutstanding")
+        beta = info.get("beta")
+        total_debt = float(info.get("totalDebt", 0) or 0)
+        cash = float(info.get("totalCash", 0) or 0)
+        name = info.get("shortName", ticker)
 
-        # Clamp to reasonable range or use default
-        if raw_eps is not None and raw_eps > 0:
-            eps_5y = max(EPS_MIN, min(raw_eps, EPS_MAX))
-            eps_capped = raw_eps > EPS_MAX or raw_eps < EPS_MIN
-        else:
-            eps_5y = DEFAULT_EPS_5Y
-            eps_capped = False
+        # Convert debt/cash for foreign stocks
+        if fin_curr != "USD":
+            total_debt *= fx
+            cash *= fx
 
-        # Check if operating cash flow is growing (compare last 2 years)
-        growing_cf = True
-        for label in ["Operating Cash Flow", "Total Cash From Operating Activities"]:
-            if label in cashflow.index:
-                cf_series = cashflow.loc[label].dropna()
-                if len(cf_series) >= 2:
-                    growing_cf = float(cf_series.iloc[0]) > float(cf_series.iloc[1])
-                break
-
-        # For DE model (not growing CF), use net income instead
-        net_income = None
-        if not growing_cf:
-            bs = stock.income_stmt
-            if bs is not None and not bs.empty:
-                for label in ["Net Income", "Net Income Common Stockholders"]:
-                    if label in bs.index:
-                        net_income = float(bs.loc[label].dropna().iloc[0])
-                        break
-
-        if current_price is None or shares_outstanding is None or shares_outstanding == 0:
+        if current_price is None or shares is None or shares == 0:
             return None
         if beta is None:
-            beta = 1.0  # fallback
+            beta = 1.0
 
         return {
             "ticker": ticker,
-            "name": company_name,
+            "name": name,
             "current_price": float(current_price),
-            "op_cf": float(op_cf),
-            "avg_capex": avg_capex,
-            "base_cf": base_cf,
-            "net_income": net_income,
-            "growing_cf": growing_cf,
-            "shares_outstanding": float(shares_outstanding),
-            "total_debt": float(total_debt),
-            "cash": float(cash),
+            "ocf": ocf,
+            "capex": capex,
+            "fcf": fcf,
+            "rev_curr": rev_curr,
+            "rev_next": rev_next,
+            "growth_5y": growth_5y,
+            "growth_flag": growth_flag,
+            "shares": float(shares),
+            "total_debt": total_debt,
+            "cash": cash,
             "beta": float(beta),
-            "raw_eps": float(raw_eps) if raw_eps is not None else None,
-            "eps_source": eps_source,
-            "eps_capped": eps_capped,
-            "eps_5y": float(eps_5y) if eps_5y else DEFAULT_EPS_5Y,
+            "fin_curr": fin_curr,
+            "fx": fx,
         }
     except Exception:
         return None
 
 
-def calculate_intrinsic_value(
-    data: dict,
-    eps_5y_override: float | None,
-    eps_6_10y: float,
-    eps_11_20y: float,
-) -> dict | None:
-    """
-    Calculate intrinsic value per share — exact Excel logic:
+def calculate_dcf(data: dict) -> dict | None:
+    """Calculate intrinsic value per share — exact Sheet4 logic.
 
-    1. Determine valuation method: DCF (growing CF) or DE (not growing CF)
-    2. Base value = FCF (for DCF) or Net Income (for DE)
-    3. Project cash flows for 20 years in 3 phases:
-       - Years 1-5:   grow at EPS next 5Y rate
-       - Years 6-10:  grow at EPS next 6-10Y rate
-       - Years 11-20: grow at EPS next 11-20Y rate
-    4. Discount factors: 1/(1+r), compounding each year
-    5. Discounted CF = projected CF × discount factor for each year
-    6. Sum all 20 discounted CFs
-    7. Value per share = sum / shares outstanding
-    8. Intrinsic Value = Value per share - Debt per share + Cash per share
-    9. Under/Overpriced = (Market Price - Intrinsic Value) / Intrinsic Value
+    Sheet4 formula chain:
+    1. FCF = OCF - CapEx                              (B2 = B3 - B4)
+    2. Growth Y1-5 = RevNext/RevCurr - 1              (B5 = B7/B6 - 1)
+    3. Project FCF 10 years (compound)                 (B11:B20)
+    4. Discount factors: 1/(1+r)^n                     (B24:B33)
+    5. Discounted CFs = projected * discount           (B35:B44)
+    6. Terminal Value = CF10*(1+gT)/(r-gT)             (B45)
+    7. TV Present Value = TV/(1+r)^10                  (B46)
+    8. Enterprise Value = sum(discounted CFs) + TV_PV  (B48 = B34 + B46)
+    9. Equity Value = EV + Cash - Debt                 (B47 = B48 + B49 - B50)
+    10. Intrinsic Value = Equity / Shares              (B52 = B47 / B51)
     """
     try:
-        method = "DCF" if data["growing_cf"] else "DE"
-
-        # Base cash flow
-        if method == "DCF":
-            base = data["base_cf"]
-        else:
-            base = data["net_income"]
-            if base is None or base <= 0:
-                return None
-
-        if base <= 0:
+        fcf = data["fcf"]
+        if fcf <= 0:
             return None
 
-        eps_5y = eps_5y_override if eps_5y_override is not None else data["eps_5y"]
-        discount_rate = beta_to_discount_rate(data["beta"])
-        shares = data["shares_outstanding"]
+        dr = beta_to_discount_rate(data["beta"])
+        g5 = data["growth_5y"]
+        denom = dr - TERMINAL_GROWTH
+        if denom <= 0:
+            return None
 
-        # --- Step 3: Project Cash Flows (20 years, 3 phases) ---
+        # Step 3: Project FCF 10 years
         projected = []
-        prev = base
-        for year in range(1, 21):
-            if year <= 5:
-                growth = eps_5y
-            elif year <= 10:
-                growth = eps_6_10y
-            else:
-                growth = eps_11_20y
-            prev = prev * (1 + growth)
+        prev = fcf
+        for yr in range(1, 11):
+            g = g5 if yr <= 5 else GROWTH_6_10
+            prev = prev * (1 + g)
             projected.append(prev)
 
-        # --- Step 4: Discount Factors ---
-        discount_factors = []
-        df = 1.0
-        for year in range(1, 21):
-            df = df / (1 + discount_rate)
-            discount_factors.append(df)
+        # Step 4: Discount factors
+        disc_factors = []
+        d = 1.0
+        for yr in range(1, 11):
+            d = d / (1 + dr)
+            disc_factors.append(d)
 
-        # --- Step 5-6: Discounted Cash Flows ---
-        discounted = [p * d for p, d in zip(projected, discount_factors)]
-        total_dcf = sum(discounted)
+        # Step 5: Discounted CFs
+        discounted = [p * d for p, d in zip(projected, disc_factors)]
+        sum_dcf = sum(discounted)
 
-        # --- Step 7-8: Intrinsic Value per Share ---
-        value_per_share = total_dcf / shares
-        debt_per_share = data["total_debt"] / shares
-        cash_per_share = data["cash"] / shares
-        intrinsic_value = value_per_share - debt_per_share + cash_per_share
+        # Step 6-7: Terminal Value
+        tv = projected[9] * (1 + TERMINAL_GROWTH) / denom
+        tv_pv = tv / (1 + dr) ** 10
 
-        # --- Step 9: Under/Overpriced ---
-        # Skip if intrinsic value is non-positive or absurdly low vs market price
-        # (e.g. price > 3x IV means model inputs are unreliable for this stock)
-        if intrinsic_value <= 0:
+        # Step 8: Enterprise Value (Sheet4 naming)
+        ev = sum_dcf + tv_pv
+
+        # Step 9: Equity Value = EV + Cash - Debt
+        equity = ev + data["cash"] - data["total_debt"]
+
+        # Step 10: Intrinsic Value per share
+        iv = equity / data["shares"]
+
+        if iv <= 0:
             return None
-        if data["current_price"] > intrinsic_value * 3:
-            return None
-        under_over = (data["current_price"] - intrinsic_value) / intrinsic_value
-        diff_pct = -under_over * 100  # positive = undervalued
+
+        over_under = (data["current_price"] - iv) / iv * 100
 
         return {
             "ticker": data["ticker"],
             "name": data["name"],
-            "method": method,
             "current_price": data["current_price"],
-            "intrinsic_value": round(intrinsic_value, 2),
-            "diff_pct": round(diff_pct, 1),
+            "intrinsic_value": round(iv, 2),
+            "over_under": round(over_under, 1),
             "beta": data["beta"],
-            "discount_rate": discount_rate,
-            "eps_5y": eps_5y,
-            "base_cf": base,
-            "total_dcf": round(total_dcf, 0),
-            "value_per_share": round(value_per_share, 2),
-            "debt_per_share": round(debt_per_share, 2),
-            "cash_per_share": round(cash_per_share, 2),
+            "discount_rate": dr,
+            "growth_5y": g5,
+            "fcf": fcf,
+            "sum_dcf": sum_dcf,
+            "tv": tv,
+            "tv_pv": tv_pv,
+            "ev": ev,
+            "equity": equity,
             "total_debt": data["total_debt"],
             "cash": data["cash"],
-            "shares_outstanding": data["shares_outstanding"],
+            "shares": data["shares"],
+            "ocf": data["ocf"],
+            "capex": data["capex"],
+            "growth_flag": data["growth_flag"],
+            "rev_curr": data["rev_curr"],
+            "rev_next": data["rev_next"],
+            "fin_curr": data["fin_curr"],
+            "fx": data["fx"],
         }
     except Exception:
         return None
@@ -308,32 +258,27 @@ def calculate_intrinsic_value(
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_all_raw(tickers: tuple[str, ...]) -> list[dict]:
     """Fetch raw data for all tickers. Cached for 1 hour."""
+    fx_rates = get_fx_rates()
     all_raw = []
     for ticker in tickers:
-        data = fetch_stock_data(ticker)
+        data = fetch_stock_data(ticker, fx_rates)
         if data is not None:
             all_raw.append(data)
     return all_raw
 
 
-def compute_all(
-    all_raw: list[dict],
-    eps_6_10y: float,
-    eps_11_20y: float,
-) -> tuple[pd.DataFrame, list[str]]:
-    """Calculate intrinsic value for all fetched tickers.
-    Returns (results_df, list_of_skipped_tickers)."""
+def compute_all(all_raw: list[dict]) -> tuple[pd.DataFrame, list[str]]:
+    """Calculate DCF for all fetched tickers."""
     results = []
     skipped = []
-    all_tickers_fetched = {d["ticker"] for d in all_raw}
+    fetched = {d["ticker"] for d in all_raw}
 
-    # Mark tickers that failed to fetch
     for t in TICKERS:
-        if t not in all_tickers_fetched:
+        if t not in fetched:
             skipped.append(t)
 
     for data in all_raw:
-        result = calculate_intrinsic_value(data, None, eps_6_10y, eps_11_20y)
+        result = calculate_dcf(data)
         if result is None:
             skipped.append(data["ticker"])
             continue
@@ -343,60 +288,43 @@ def compute_all(
         return pd.DataFrame(), skipped
 
     df = pd.DataFrame(results)
-    df = df.sort_values("diff_pct", ascending=False).reset_index(drop=True)
+    df = df.sort_values("over_under", ascending=True).reset_index(drop=True)
     return df, skipped
 
 
 # ---------------------------------------------------------------------------
-# Data quality checks for verification tab
+# Data quality checks
 # ---------------------------------------------------------------------------
 
 def assess_quality(row: dict) -> tuple[str, list[str]]:
-    """Return (status_emoji, list_of_reasons) for a single stock's raw data.
-
-    Returns:
-        ("green" | "yellow" | "red",  [reason strings])
-    """
+    """Quality flag: green/yellow/red with reasons."""
     issues_yellow = []
     issues_red = []
 
-    ocf_m = row["op_cf"] / 1e6
-    capex_m = row["avg_capex"] / 1e6
-    fcf_m = row["base_cf"] / 1e6
-    shares_m = row["shares_outstanding"] / 1e6
-    raw_eps = row["raw_eps"]
+    M = 1e6
+    ocf_m = row["ocf"] / M
+    fcf_m = row["fcf"] / M
+    shares_m = row["shares"] / M
 
-    # RED checks — data is probably wrong
+    # RED — data probably wrong
     if shares_m < 1:
-        issues_red.append(f"Akcje < 1M ({shares_m:.2f}M)")
+        issues_red.append(f"Shares < 1M ({shares_m:.2f}M)")
     if ocf_m == 0:
         issues_red.append("OCF = 0")
-    if ocf_m > 1_000_000:
-        issues_red.append(f"OCF > 1 000 000M ({ocf_m:,.0f}M) — prawdopodobnie bledne jednostki")
-    if row["total_debt"] / 1e6 > 1_000_000:
-        issues_red.append(f"Dlug > 1 000 000M — prawdopodobnie bledne jednostki")
-    if row["cash"] / 1e6 > 1_000_000:
-        issues_red.append(f"Cash > 1 000 000M — prawdopodobnie bledne jednostki")
+    if abs(ocf_m) > 1_000_000:
+        issues_red.append(f"OCF > 1,000,000M — likely wrong units")
 
-    # YELLOW checks — something is suspicious
-    eps_capped = row.get("eps_capped", False)
-    eps_source = row.get("eps_source", "default")
-    if raw_eps is not None and raw_eps > 0.25:
-        issues_yellow.append(f"EPS raw = {raw_eps:.0%} → ograniczono do 25% ({eps_source})")
-    elif raw_eps is not None and 0 < raw_eps < 0.03:
-        issues_yellow.append(f"EPS raw = {raw_eps:.1%} → podniesiono do 3% ({eps_source})")
-    if raw_eps is not None and raw_eps <= 0:
-        issues_yellow.append(f"EPS raw = {raw_eps:.1%} (ujemny) → domyslne 12% ({eps_source})")
-    if raw_eps is None:
-        issues_yellow.append("Brak EPS growth z Yahoo → domyslne 12%")
-    if eps_source == "default":
-        issues_yellow.append("Uzyto domyslny EPS 12% (brak danych analitycznych)")
+    # YELLOW — suspicious
+    if row["growth_flag"] == "default":
+        issues_yellow.append("No analyst revenue estimates — using default 8%")
     if fcf_m < 0:
-        issues_yellow.append(f"FCF ujemny ({fcf_m:,.0f}M)")
-    if not row["growing_cf"]:
-        issues_yellow.append("OCF nie rosnie — metoda DE zamiast DCF")
+        issues_yellow.append(f"FCF negative ({fcf_m:,.0f}M)")
     if row["beta"] > 2.0:
-        issues_yellow.append(f"Beta bardzo wysoka ({row['beta']:.2f})")
+        issues_yellow.append(f"High Beta ({row['beta']:.2f})")
+    if row["fin_curr"] != "USD":
+        issues_yellow.append(f"FX conversion: {row['fin_curr']} -> USD (rate: {row['fx']:.4f})")
+    if row["growth_5y"] > 0.30:
+        issues_yellow.append(f"Revenue growth {row['growth_5y']:.0%} > 30%")
 
     if issues_red:
         return "red", issues_red + issues_yellow
@@ -409,174 +337,149 @@ def assess_quality(row: dict) -> tuple[str, list[str]]:
 # Streamlit UI
 # ---------------------------------------------------------------------------
 
-def color_row(row):
-    """Green for undervalued (positive diff), red for overvalued (negative diff)."""
-    if row["Roznica %"] > 0:
+def color_valuation_row(row):
+    """Green when IV > price (undervalued), red when IV < price (overvalued)."""
+    if row["Over/Under (%)"] < 0:
         return ["background-color: #d4edda; color: #155724"] * len(row)
-    elif row["Roznica %"] < 0:
+    elif row["Over/Under (%)"] > 0:
         return ["background-color: #f8d7da; color: #721c24"] * len(row)
     return [""] * len(row)
 
 
 def render_valuation_tab(df, skipped):
-    """Render the main valuation results tab."""
-    # --- Summary metrics ---
-    undervalued = len(df[df["diff_pct"] > 0])
-    overvalued = len(df[df["diff_pct"] < 0])
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Przeanalizowane", len(df))
-    col2.metric("Niedowartosciowane", undervalued)
-    col3.metric("Przewartosciowane", overvalued)
-    col4.metric("DCF / DE", f'{len(df[df["method"]=="DCF"])} / {len(df[df["method"]=="DE"])}')
+    """Main valuation results tab."""
+    undervalued = len(df[df["over_under"] < 0])
+    overvalued = len(df[df["over_under"] > 0])
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Przeanalizowane", len(df))
+    c2.metric("Niedowartosciowane", undervalued)
+    c3.metric("Przewartosciowane", overvalued)
 
     if skipped:
-        st.info(
-            f"Pominiete spolki (brak danych lub ujemny FCF/zysk netto): "
-            f"**{', '.join(skipped)}**"
-        )
+        st.info(f"Pominiete (brak danych / ujemny FCF): **{', '.join(skipped)}**")
 
-    # --- Main table ---
     display_df = df[[
-        "ticker", "name", "method", "current_price",
-        "intrinsic_value", "diff_pct",
+        "ticker", "name", "current_price", "intrinsic_value", "over_under",
     ]].copy()
     display_df.columns = [
-        "Ticker", "Spolka", "Metoda", "Cena ($)",
-        "Wartosc wewnetrzna ($)", "Roznica %",
+        "Ticker", "Spolka", "Cena ($)", "Intrinsic Value ($)", "Over/Under (%)",
     ]
 
     styled = (
         display_df.style
-        .apply(color_row, axis=1)
+        .apply(color_valuation_row, axis=1)
         .format({
             "Cena ($)": "${:,.2f}",
-            "Wartosc wewnetrzna ($)": "${:,.2f}",
-            "Roznica %": "{:+.1f}%",
+            "Intrinsic Value ($)": "${:,.2f}",
+            "Over/Under (%)": "{:+.1f}%",
         })
     )
-
     st.dataframe(styled, use_container_width=True, hide_index=True, height=740)
 
-    # --- Expandable: DCF breakdown ---
-    with st.expander("Szczegoly kalkulacji"):
-        detail_df = df[[
-            "ticker", "method", "beta", "discount_rate", "eps_5y",
-            "base_cf", "total_dcf", "value_per_share",
-            "debt_per_share", "cash_per_share", "intrinsic_value",
+    with st.expander("Szczegoly kalkulacji DCF"):
+        det = df[[
+            "ticker", "beta", "discount_rate", "growth_5y",
+            "fcf", "sum_dcf", "tv_pv", "ev", "equity", "intrinsic_value",
         ]].copy()
-        detail_df.columns = [
-            "Ticker", "Metoda", "Beta", "Stopa dysk.", "EPS 5Y",
-            "Baza CF ($)", "Suma DCF ($)", "Wartosc/akcje ($)",
-            "Dlug/akcje ($)", "Gotowka/akcje ($)", "Wart. wewn. ($)",
+        det.columns = [
+            "Ticker", "Beta", "Stopa dysk.", "Growth Y1-5",
+            "FCF ($)", "Sum DCF ($)", "TV PV ($)", "EV ($)",
+            "Equity ($)", "IV ($/share)",
         ]
         st.dataframe(
-            detail_df.style.format({
-                "Beta": "{:.2f}",
-                "Stopa dysk.": "{:.1%}",
-                "EPS 5Y": "{:.1%}",
-                "Baza CF ($)": "${:,.0f}",
-                "Suma DCF ($)": "${:,.0f}",
-                "Wartosc/akcje ($)": "${:,.2f}",
-                "Dlug/akcje ($)": "${:,.2f}",
-                "Gotowka/akcje ($)": "${:,.2f}",
-                "Wart. wewn. ($)": "${:,.2f}",
+            det.style.format({
+                "Beta": "{:.2f}", "Stopa dysk.": "{:.1%}", "Growth Y1-5": "{:.1%}",
+                "FCF ($)": "${:,.0f}", "Sum DCF ($)": "${:,.0f}",
+                "TV PV ($)": "${:,.0f}", "EV ($)": "${:,.0f}",
+                "Equity ($)": "${:,.0f}", "IV ($/share)": "${:,.2f}",
             }),
-            use_container_width=True,
-            hide_index=True,
+            use_container_width=True, hide_index=True,
         )
 
 
 def render_verification_tab(all_raw):
-    """Render the data verification / quality control tab."""
+    """Data verification tab with quality flags."""
     if not all_raw:
-        st.warning("Brak danych do weryfikacji. Odswierz dane na zakladce Wycena.")
+        st.warning("Brak danych. Kliknij 'Odswiez dane'.")
         return
 
-    # Build verification table and quality assessments
     rows = []
     for d in all_raw:
         status, reasons = assess_quality(d)
-        method = "DCF" if d["growing_cf"] else "DE"
-        emoji = {"green": "🟢", "yellow": "🟡", "red": "🔴"}[status]
+        emoji = {"green": "\U0001f7e2", "yellow": "\U0001f7e1", "red": "\U0001f534"}[status]
+        M = 1e6
+        B = 1e9
         rows.append({
             "Status": emoji,
             "Ticker": d["ticker"],
-            "OCF TTM ($M)": round(d["op_cf"] / 1e6, 1),
-            "CapEx sr. 3 lata ($M)": round(d["avg_capex"] / 1e6, 1),
-            "FCF ($M)": round(d["base_cf"] / 1e6, 1),
-            "Total Debt ($M)": round(d["total_debt"] / 1e6, 1),
-            "Cash ($M)": round(d["cash"] / 1e6, 1),
-            "Akcje (M)": round(d["shares_outstanding"] / 1e6, 1),
+            "Waluta": d["fin_curr"],
+            "FX": round(d["fx"], 4) if d["fin_curr"] != "USD" else None,
+            "OCF TTM ($M)": round(d["ocf"] / M, 1),
+            "CapEx TTM ($M)": round(d["capex"] / M, 1),
+            "FCF ($M)": round(d["fcf"] / M, 1),
+            "Rev Curr ($B)": round(d["rev_curr"] / B, 2) if d["rev_curr"] else None,
+            "Rev Next ($B)": round(d["rev_next"] / B, 2) if d["rev_next"] else None,
+            "Growth Y1-5": d["growth_5y"],
+            "Growth src": d["growth_flag"],
             "Beta": round(d["beta"], 2),
-            "Stopa dysk. (%)": round(beta_to_discount_rate(d["beta"]) * 100, 1),
-            "EPS Growth 5Y (%)": round(d["eps_5y"] * 100, 1),
-            "EPS Yahoo raw (%)": round(d["raw_eps"] * 100, 1) if d["raw_eps"] is not None else None,
-            "Zrodlo EPS": d.get("eps_source", "default"),
-            "Metoda": method,
+            "Stopa dysk.": beta_to_discount_rate(d["beta"]),
+            "Debt ($M)": round(d["total_debt"] / M, 1),
+            "Cash ($M)": round(d["cash"] / M, 1),
+            "Shares (M)": round(d["shares"] / M, 1),
             "_status": status,
             "_reasons": reasons,
         })
 
     vdf = pd.DataFrame(rows)
-
-    # --- Summary counts ---
-    n_green = sum(1 for r in rows if r["_status"] == "green")
-    n_yellow = sum(1 for r in rows if r["_status"] == "yellow")
-    n_red = sum(1 for r in rows if r["_status"] == "red")
+    n_g = sum(1 for r in rows if r["_status"] == "green")
+    n_y = sum(1 for r in rows if r["_status"] == "yellow")
+    n_r = sum(1 for r in rows if r["_status"] == "red")
 
     st.markdown(
-        f"**Kontrola jakosci danych:** "
-        f"🟢 {n_green} OK  &nbsp;&nbsp; "
-        f"🟡 {n_yellow} watpliwe  &nbsp;&nbsp; "
-        f"🔴 {n_red} prawdopodobnie bledne  &nbsp;&nbsp; "
-        f"(lacznie {len(rows)} spolek)"
+        f"**Kontrola jakosci:** "
+        f"\U0001f7e2 {n_g} OK &nbsp;&nbsp; "
+        f"\U0001f7e1 {n_y} watpliwe &nbsp;&nbsp; "
+        f"\U0001f534 {n_r} bledne &nbsp;&nbsp; "
+        f"(lacznie {len(rows)})"
     )
 
-    # --- Main verification table ---
     display_cols = [
-        "Status", "Ticker", "OCF TTM ($M)", "CapEx sr. 3 lata ($M)",
-        "FCF ($M)", "Total Debt ($M)", "Cash ($M)", "Akcje (M)",
-        "Beta", "Stopa dysk. (%)", "EPS Growth 5Y (%)", "EPS Yahoo raw (%)",
-        "Zrodlo EPS", "Metoda",
+        "Status", "Ticker", "Waluta", "FX",
+        "OCF TTM ($M)", "CapEx TTM ($M)", "FCF ($M)",
+        "Rev Curr ($B)", "Rev Next ($B)", "Growth Y1-5", "Growth src",
+        "Beta", "Stopa dysk.", "Debt ($M)", "Cash ($M)", "Shares (M)",
     ]
 
     def color_status_row(row):
-        status_char = row["Status"]
-        if status_char == "🔴":
+        s = row["Status"]
+        if s == "\U0001f534":
             return ["background-color: #f8d7da; color: #721c24"] * len(row)
-        elif status_char == "🟡":
+        elif s == "\U0001f7e1":
             return ["background-color: #fff3cd; color: #856404"] * len(row)
-        elif status_char == "🟢":
+        elif s == "\U0001f7e2":
             return ["background-color: #d4edda; color: #155724"] * len(row)
         return [""] * len(row)
 
-    styled_v = (
+    styled = (
         vdf[display_cols].style
         .apply(color_status_row, axis=1)
         .format({
-            "OCF TTM ($M)": "{:,.1f}",
-            "CapEx sr. 3 lata ($M)": "{:,.1f}",
-            "FCF ($M)": "{:,.1f}",
-            "Total Debt ($M)": "{:,.1f}",
-            "Cash ($M)": "{:,.1f}",
-            "Akcje (M)": "{:,.1f}",
-            "Beta": "{:.2f}",
-            "Stopa dysk. (%)": "{:.1f}%",
-            "EPS Growth 5Y (%)": "{:.1f}%",
-            "EPS Yahoo raw (%)": "{:.1f}%",
-        }, na_rep="brak")
+            "FX": "{:.4f}",
+            "OCF TTM ($M)": "{:,.1f}", "CapEx TTM ($M)": "{:,.1f}",
+            "FCF ($M)": "{:,.1f}", "Rev Curr ($B)": "{:,.2f}",
+            "Rev Next ($B)": "{:,.2f}", "Growth Y1-5": "{:.1%}",
+            "Beta": "{:.2f}", "Stopa dysk.": "{:.1%}",
+            "Debt ($M)": "{:,.1f}", "Cash ($M)": "{:,.1f}",
+            "Shares (M)": "{:,.1f}",
+        }, na_rep="-")
     )
+    st.dataframe(styled, use_container_width=True, hide_index=True, height=740)
 
-    st.dataframe(styled_v, use_container_width=True, hide_index=True, height=740)
-
-    # --- Detailed issues per stock ---
     flagged = [r for r in rows if r["_reasons"]]
     if flagged:
         with st.expander(f"Szczegoly problemow ({len(flagged)} spolek)"):
             for r in flagged:
-                emoji = r["Status"]
-                reasons_str = " | ".join(r["_reasons"])
-                st.markdown(f"{emoji} **{r['Ticker']}**: {reasons_str}")
+                st.markdown(f"{r['Status']} **{r['Ticker']}**: {' | '.join(r['_reasons'])}")
 
 
 def main():
@@ -588,89 +491,72 @@ def main():
 
     st.title("DCF Intrinsic Value Calculator")
     st.caption(
-        "Wycena wartosci wewnetrznej spolek metoda zdyskontowanych przeplywow pienieznych (DCF) / "
-        "zdyskontowanych zyskow (DE) — logika z Calculator_Intrinsic_Value.xlsx"
+        "Wycena 44 spolek metoda DCF — logika z IV calc.xlsx Sheet4 | "
+        "10-letnia projekcja FCF, revenue-based growth, Terminal Value (Gordon Growth)"
     )
 
-    # --- Sidebar: growth assumptions ---
+    # --- Sidebar ---
     with st.sidebar:
-        st.header("Zalozenia wzrostu")
+        st.header("Model DCF")
         st.markdown(
-            "Stopa dyskontowa jest wyznaczana automatycznie na podstawie **Beta** "
-            "(tabela progowa z Excela)."
+            "**Logika z IV calc.xlsx Sheet4:**\n"
+            "- FCF = OCF TTM - CapEx TTM\n"
+            "- Growth Y1-5 = Revenue Next / Revenue Curr - 1\n"
+            "- Growth Y6-10 = 4%\n"
+            "- Terminal Growth = 3%\n"
+            "- Discount Rate = f(Beta)\n"
+            "- TV = CF10 x (1+gT) / (r-gT)\n"
+            "- Equity = EV + Cash - Debt\n"
+            "- IV = Equity / Shares"
         )
-
-        st.subheader("Fazy wzrostu (20 lat)")
-
-        st.markdown("**Lata 1-5:** stopa EPS next 5Y pobierana z Yahoo Finance per spolka")
-
-        eps_6_10y = st.slider(
-            "Lata 6-10: EPS growth (%)", 1.0, 30.0, DEFAULT_EPS_6_10Y * 100, 0.5,
-            help="Domyslnie 15% — z Excela B30",
-        ) / 100
-
-        eps_11_20y = st.slider(
-            "Lata 11-20: EPS growth (%)", 1.0, 15.0, DEFAULT_EPS_11_20Y * 100, 0.1,
-            help="Domyslnie 4.18% — z Excela B31 (zblizona do dlugoterminowego wzrostu PKB)",
-        ) / 100
-
         st.divider()
-        st.markdown("**Tabela stop dyskontowych (Beta -> r):**")
-        beta_table = pd.DataFrame({
+        st.markdown("**Stopy dyskontowe (Beta -> r):**")
+        bt = pd.DataFrame({
             "Beta": ["<= 0.80", "0.81-1.05", "1.06-1.15", "1.16-1.25",
                       "1.26-1.35", "1.36-1.45", "1.46-1.55", "> 1.55"],
             "r": ["5.0%", "6.0%", "6.5%", "7.0%", "7.5%", "7.7%", "8.0%", "8.2%"],
         })
-        st.dataframe(beta_table, hide_index=True, use_container_width=True)
-
+        st.dataframe(bt, hide_index=True, use_container_width=True)
         st.divider()
-        st.markdown("**Metoda wyceny:**")
-        st.markdown(
-            "- **DCF** — gdy Operating Cash Flow rosnie (baza = FCF)\n"
-            "- **DE** — gdy nie rosnie (baza = Net Income)"
+        st.caption(
+            "Spolki zagraniczne (BABA, ASML, LVMUY) — dane finansowe "
+            "przeliczane z CNY/EUR na USD wg aktualnego kursu."
         )
 
-    # --- Main area ---
+    # --- Main ---
     if st.button("Odswiez dane", type="primary", use_container_width=True):
         fetch_all_raw.clear()
-        st.session_state.pop("df_results", None)
-        st.session_state.pop("params", None)
-
-    current_params = (eps_6_10y, eps_11_20y)
-
-    # Fetch raw data (cached for 1 hour, re-fetched only on "Odswiez dane")
-    with st.spinner(f"Pobieram dane z Yahoo Finance dla {len(TICKERS)} spolek..."):
-        all_raw = fetch_all_raw(tuple(TICKERS))
-
-    # Recalculate when params change (instant, no re-fetch)
-    if st.session_state.get("params") != current_params:
+        get_fx_rates.clear()
         st.session_state.pop("df_results", None)
 
     if "df_results" not in st.session_state:
-        df, skipped = compute_all(all_raw, eps_6_10y, eps_11_20y)
+        with st.spinner(f"Pobieram dane z Yahoo Finance dla {len(TICKERS)} spolek..."):
+            all_raw = fetch_all_raw(tuple(TICKERS))
+        df, skipped = compute_all(all_raw)
         st.session_state["df_results"] = df
         st.session_state["skipped"] = skipped
-        st.session_state["params"] = current_params
+        st.session_state["all_raw"] = all_raw
+    else:
+        all_raw = st.session_state.get("all_raw", [])
 
     df = st.session_state.get("df_results", pd.DataFrame())
     skipped = st.session_state.get("skipped", [])
 
-    # --- Tabs ---
-    tab_valuation, tab_verification = st.tabs(["Wycena DCF", "Weryfikacja danych"])
+    tab1, tab2 = st.tabs(["Wycena DCF", "Weryfikacja danych"])
 
-    with tab_valuation:
+    with tab1:
         if df.empty:
-            st.warning("Brak danych do wyswietlenia. Sprobuj odswiez.")
+            st.warning("Brak danych. Kliknij 'Odswiez dane'.")
         else:
             render_valuation_tab(df, skipped)
 
-    with tab_verification:
+    with tab2:
         render_verification_tab(all_raw)
 
     st.divider()
     st.caption(
-        "Dane: Yahoo Finance | Metoda: DCF/DE (20-letnia projekcja, 3 fazy wzrostu) | "
-        "Logika: Calculator_Intrinsic_Value.xlsx | Nie stanowi porady inwestycyjnej"
+        "Dane: Yahoo Finance | Metoda: DCF 10Y + Terminal Value (IV calc.xlsx Sheet4) | "
+        "Nie stanowi porady inwestycyjnej"
     )
 
 
